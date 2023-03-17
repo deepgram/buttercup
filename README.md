@@ -17,6 +17,7 @@ After the Chat GPT implementation has been completed, I intend to fork this repo
 You can spin up the server by simply running `cargo run`. However, you will need the following environment variables set:
 
 * `DEEPGRAM_API_KEY`: a Deepgram API Key to enable transcription
+* `CLEVERBOT_API_KEY`: a Cleverbot API Key to chat with Cleverbot
 * `TWILIO_PHONE_NUMBER`: your Twilio phone number using a TwiML Bin set to stream to this server
 * `AWS_REGION`: the AWS region to use for Polly (`us-west-2` should be fine)
 * `AWS_ACCESS_KEY_ID`: AWS Key ID for Polly

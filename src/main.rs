@@ -3,6 +3,7 @@ use axum_server::tls_rustls::RustlsConfig;
 use std::sync::Arc;
 
 mod audio;
+mod cleverbot_response;
 mod deepgram_response;
 mod handlers;
 mod message;
@@ -17,8 +18,11 @@ async fn main() {
         "wss://api.deepgram.com/v1/listen?encoding=mulaw&sample_rate=8000&numerals=true".to_string()
     });
 
-    let api_key =
+    let deepgram_api_key =
         std::env::var("DEEPGRAM_API_KEY").expect("Using this server requires a Deepgram API Key.");
+
+    let cleverbot_api_key = std::env::var("CLEVERBOT_API_KEY")
+        .expect("Using this server requires a Cleverbot API Key.");
 
     let twilio_phone_number = std::env::var("TWILIO_PHONE_NUMBER")
         .expect("Using this server requires a Twilio phone number.");
@@ -40,7 +44,8 @@ async fn main() {
 
     let state = Arc::new(state::State {
         deepgram_url,
-        api_key,
+        deepgram_api_key,
+        cleverbot_api_key,
         twilio_phone_number,
     });
 

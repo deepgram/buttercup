@@ -1,4 +1,5 @@
 use crate::audio;
+use crate::cleverbot_response;
 use crate::deepgram_response;
 use crate::message::Message;
 use crate::state::State;
@@ -34,7 +35,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<State>) {
     let builder = http::Request::builder()
         .method(http::Method::GET)
         .uri(&state.deepgram_url);
-    let builder = builder.header("Authorization", format!("Token {}", state.api_key));
+    let builder = builder.header("Authorization", format!("Token {}", state.deepgram_api_key));
     let request = builder
         .body(())
         .expect("Failed to build a connection request to Deepgram.");
@@ -51,6 +52,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<State>) {
         deepgram_reader,
         this_sender,
         streamsid_rx,
+        state.cleverbot_api_key.clone(),
     ));
     tokio::spawn(handle_from_twilio_ws(
         this_receiver,
@@ -63,10 +65,13 @@ async fn handle_from_deepgram_ws(
     mut deepgram_receiver: SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>,
     mut twilio_sender: SplitSink<WebSocket, axum::extract::ws::Message>,
     streamsid_rx: oneshot::Receiver<String>,
+    cleverbot_api_key: String,
 ) {
     let streamsid = streamsid_rx
         .await
         .expect("Failed to receive streamsid from handle_from_twilio_ws.");
+
+    let mut cleverbot_cs = None;
 
     while let Some(Ok(msg)) = deepgram_receiver.next().await {
         if let tungstenite::Message::Text(msg) = msg.clone() {
@@ -74,54 +79,77 @@ async fn handle_from_deepgram_ws(
                 serde_json::from_str(&msg);
             match deepgram_response {
                 Ok(deepgram_response) => {
-                    for alternative in deepgram_response.channel.alternatives {
-                        let shared_config = aws_config::from_env().load().await;
-                        let client = Client::new(&shared_config);
+                    if deepgram_response.channel.alternatives.is_empty() {
+                        continue;
+                    }
 
-                        if let Ok(polly_response) = client
-                            .synthesize_speech()
-                            .output_format(OutputFormat::Pcm)
-                            .sample_rate("8000")
-                            .text(alternative.transcript)
-                            .voice_id(VoiceId::Joanna)
-                            .send()
+                    let transcript = deepgram_response.channel.alternatives[0].transcript.clone();
+
+                    let mut cleverbot_url = format!(
+                        "https://www.cleverbot.com/getreply?key={}",
+                        cleverbot_api_key
+                    );
+
+                    if let Some(cs) = cleverbot_cs.clone() {
+                        cleverbot_url = format!("{}&cs={}", cleverbot_url, cs);
+                    }
+                    cleverbot_url = format!("{}&input={}", cleverbot_url, transcript);
+
+                    if let Ok(cleverbot_response) = reqwest::get(cleverbot_url).await {
+                        if let Ok(cleverbot_response) = cleverbot_response
+                            .json::<cleverbot_response::CleverbotResponse>()
                             .await
                         {
-                            if let Ok(pcm) = polly_response
-                                .audio_stream
-                                .collect()
+                            cleverbot_cs = Some(cleverbot_response.cs);
+
+                            let shared_config = aws_config::from_env().load().await;
+                            let client = Client::new(&shared_config);
+
+                            if let Ok(polly_response) = client
+                                .synthesize_speech()
+                                .output_format(OutputFormat::Pcm)
+                                .sample_rate("8000")
+                                .text(cleverbot_response.output)
+                                .voice_id(VoiceId::Joanna)
+                                .send()
                                 .await
-                                .and_then(|aggregated_bytes| Ok(aggregated_bytes.to_vec()))
                             {
-                                let mut i16_samples = Vec::new();
-                                for i in 0..(pcm.len() / 2) {
-                                    let mut i16_sample = pcm[i * 2] as i16;
-                                    i16_sample |= ((pcm[i * 2 + 1]) as i16) << 8;
-                                    i16_samples.push(i16_sample);
-                                }
+                                if let Ok(pcm) = polly_response
+                                    .audio_stream
+                                    .collect()
+                                    .await
+                                    .and_then(|aggregated_bytes| Ok(aggregated_bytes.to_vec()))
+                                {
+                                    let mut i16_samples = Vec::new();
+                                    for i in 0..(pcm.len() / 2) {
+                                        let mut i16_sample = pcm[i * 2] as i16;
+                                        i16_sample |= ((pcm[i * 2 + 1]) as i16) << 8;
+                                        i16_samples.push(i16_sample);
+                                    }
 
-                                let mut mulaw_samples = Vec::new();
-                                for sample in i16_samples {
-                                    mulaw_samples.push(audio::linear_to_ulaw(sample));
-                                }
+                                    let mut mulaw_samples = Vec::new();
+                                    for sample in i16_samples {
+                                        mulaw_samples.push(audio::linear_to_ulaw(sample));
+                                    }
 
-                                // base64 encode the mulaw, wrap it in a Twilio media message, and send it to Twilio
-                                let base64_encoded_mulaw =
-                                    general_purpose::STANDARD.encode(&mulaw_samples);
+                                    // base64 encode the mulaw, wrap it in a Twilio media message, and send it to Twilio
+                                    let base64_encoded_mulaw =
+                                        general_purpose::STANDARD.encode(&mulaw_samples);
 
-                                let sending_media = twilio_response::SendingMedia::new(
-                                    streamsid.clone(),
-                                    base64_encoded_mulaw,
-                                );
+                                    let sending_media = twilio_response::SendingMedia::new(
+                                        streamsid.clone(),
+                                        base64_encoded_mulaw,
+                                    );
 
-                                let _ = twilio_sender
-                                    .send(
-                                        Message::Text(
-                                            serde_json::to_string(&sending_media).unwrap(),
+                                    let _ = twilio_sender
+                                        .send(
+                                            Message::Text(
+                                                serde_json::to_string(&sending_media).unwrap(),
+                                            )
+                                            .into(),
                                         )
-                                        .into(),
-                                    )
-                                    .await;
+                                        .await;
+                                }
                             }
                         }
                     }
