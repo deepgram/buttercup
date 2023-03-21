@@ -71,10 +71,8 @@ pub fn process_twilio_media(
 pub fn linear_to_ulaw(sample: i16) -> u8 {
     let mut pcm_value = sample;
     let sign = (pcm_value >> 8) & 0x80;
-    if sign != 0 {
-        if pcm_value.checked_mul(-1).is_some() {
-            pcm_value *= -1;
-        }
+    if sign != 0 && pcm_value.checked_mul(-1).is_some() {
+        pcm_value *= -1;
     }
     if pcm_value > 32635 {
         pcm_value = 32635;
