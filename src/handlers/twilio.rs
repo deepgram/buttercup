@@ -119,9 +119,9 @@ async fn handle_from_deepgram_ws(
                 .to_string(),
     });
 
+    let mut running_deepgram_response = "".to_string();
+
     while let Some(Ok(msg)) = deepgram_receiver.next().await {
-        println!("message from deepgram: {:?}", msg.clone());
-        let mut chatgpt_messages = chatgpt_messages.clone();
         if let tungstenite::Message::Text(msg) = msg.clone() {
             let deepgram_response: Result<deepgram_response::StreamingResponse, _> =
                 serde_json::from_str(&msg);
@@ -132,17 +132,31 @@ async fn handle_from_deepgram_ws(
 
                 let transcript = deepgram_response.channel.alternatives[0].transcript.clone();
 
+                if !transcript.is_empty() {
+                    running_deepgram_response = format!("{running_deepgram_response} {transcript}");
+                }
+
+                if !deepgram_response.speech_final.unwrap_or(false) {
+                    continue;
+                }
+
+                if running_deepgram_response.is_empty() {
+                    continue;
+                }
+
                 chatgpt_messages.push(ChatGPTMessage {
                     role: "user".to_string(),
-                    content: transcript.clone(),
+                    content: running_deepgram_response.clone(),
                 });
+
+                running_deepgram_response = "".to_string();
 
                 let chatgpt_request = ChatGPTRequest {
                     model: "gpt-3.5-turbo".to_string(),
                     messages: chatgpt_messages.clone(),
                 };
 
-                println!("about to make chatgpt request");
+                println!("about to make chatgpt request: {:?}", chatgpt_request);
                 let chatgpt_client = reqwest::Client::new();
                 if let Ok(chatgpt_response) = chatgpt_client
                     .post("https://api.openai.com/v1/chat/completions")
