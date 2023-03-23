@@ -17,12 +17,12 @@ use futures::{
     stream::{SplitSink, SplitStream, StreamExt},
 };
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use std::time::Duration;
 use std::{convert::From, sync::Arc};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
-use serde_json::json;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ChatGPTRequest {
@@ -122,6 +122,58 @@ async fn handle_from_deepgram_ws(
                 .to_string(),
     });
 
+    // beginning of ugly block
+    let initial_assistant_message_string =
+        "Hello, this is Paparazzi's Pizza, what would you like to order?".to_string();
+    let initial_assistant_message = ChatGPTMessage {
+        role: "assistant".to_string(),
+        content: initial_assistant_message_string.clone(),
+    };
+
+    chatgpt_messages.push(initial_assistant_message);
+    let shared_config = aws_config::from_env().load().await;
+    let client = Client::new(&shared_config);
+
+    if let Ok(polly_response) = client
+        .synthesize_speech()
+        .output_format(OutputFormat::Pcm)
+        .sample_rate("8000")
+        .text(initial_assistant_message_string.clone())
+        .voice_id(VoiceId::Joanna)
+        .send()
+        .await
+    {
+        if let Ok(pcm) = polly_response
+            .audio_stream
+            .collect()
+            .await
+            .map(|aggregated_bytes| aggregated_bytes.to_vec())
+        {
+            let mut i16_samples = Vec::new();
+            for i in 0..(pcm.len() / 2) {
+                let mut i16_sample = pcm[i * 2] as i16;
+                i16_sample |= ((pcm[i * 2 + 1]) as i16) << 8;
+                i16_samples.push(i16_sample);
+            }
+
+            let mut mulaw_samples = Vec::new();
+            for sample in i16_samples {
+                mulaw_samples.push(audio::linear_to_ulaw(sample));
+            }
+
+            // base64 encode the mulaw, wrap it in a Twilio media message, and send it to Twilio
+            let base64_encoded_mulaw = general_purpose::STANDARD.encode(&mulaw_samples);
+
+            let sending_media =
+                twilio_response::SendingMedia::new(streamsid.clone(), base64_encoded_mulaw);
+
+            let _ = twilio_sender
+                .send(Message::Text(serde_json::to_string(&sending_media).unwrap()).into())
+                .await;
+        }
+    }
+    // end of ugly block
+
     let mut running_deepgram_response = "".to_string();
 
     while let Some(Ok(msg)) = deepgram_receiver.next().await {
@@ -138,9 +190,9 @@ async fn handle_from_deepgram_ws(
                     if let Some(subscribers) = subscribers.get_mut(&streamsid) {
                         println!("sending deepgram response to the subscribers");
                         // send the messages to all subscribers concurrently
-                        let futs = subscribers.iter_mut().map(|subscriber| {
-                            subscriber.send(Message::Text(msg.clone()).into())
-                        });
+                        let futs = subscribers
+                            .iter_mut()
+                            .map(|subscriber| subscriber.send(Message::Text(msg.clone()).into()));
                         let results = futures::future::join_all(futs).await;
 
                         // if we successfully sent a message then the subscriber is still connected
@@ -148,9 +200,7 @@ async fn handle_from_deepgram_ws(
                         *subscribers = subscribers
                             .drain(..)
                             .zip(results)
-                            .filter_map(|(subscriber, result)| {
-                                result.is_ok().then_some(subscriber)
-                            })
+                            .filter_map(|(subscriber, result)| result.is_ok().then_some(subscriber))
                             .collect();
                     }
                 }
@@ -162,7 +212,10 @@ async fn handle_from_deepgram_ws(
                     let _ = twilio_sender
                         .send(
                             Message::Text(
-                                serde_json::to_string(&json!({ "event": "clear", "streamSid": streamsid })).unwrap(),
+                                serde_json::to_string(
+                                    &json!({ "event": "clear", "streamSid": streamsid }),
+                                )
+                                .unwrap(),
                             )
                             .into(),
                         )
@@ -201,13 +254,14 @@ async fn handle_from_deepgram_ws(
                         .send();
                     if let Ok(response) = timeout(Duration::from_millis(5000), chatgpt_future).await
                     {
+                        println!("got chatgpt response: {:?}", response);
                         chatgpt_response = Some(response);
                         break;
                     }
                 }
                 if let Some(Ok(chatgpt_response)) = chatgpt_response {
                     if let Ok(chatgpt_response) = chatgpt_response.json::<ChatGPTResponse>().await {
-                        println!("got chatgpt response: {:?}", chatgpt_response);
+                        println!("got chatgpt Ok response: {:?}", chatgpt_response);
                         chatgpt_messages.push(chatgpt_response.choices[0].message.clone());
 
                         let shared_config = aws_config::from_env().load().await;
@@ -307,6 +361,7 @@ async fn handle_from_twilio_ws(
 
     // wrap our oneshot in an Option because we will need it in a loop
     let mut streamsid_tx = Some(streamsid_tx);
+    let mut streamsid: Option<String> = None;
 
     while let Some(Ok(msg)) = this_receiver.next().await {
         let msg = Message::from(msg);
@@ -315,6 +370,8 @@ async fn handle_from_twilio_ws(
             if let Ok(event) = event {
                 match event.event_type {
                     twilio_response::EventType::Start(start) => {
+                        streamsid = Some(start.stream_sid.clone());
+
                         // sending this streamsid on our oneshot will let `handle_from_deepgram_ws` know the streamsid
                         if let Some(streamsid_tx) = streamsid_tx.take() {
                             streamsid_tx
@@ -343,6 +400,17 @@ async fn handle_from_twilio_ws(
                         }
                     }
                 }
+            }
+        }
+    }
+
+    // close and remove the subscribers, if we have a streamsid
+    if let Some(streamsid) = streamsid {
+        let mut subscribers = state.subscribers.lock().await;
+        if let Some(subscribers) = subscribers.remove(&streamsid) {
+            for mut subscriber in subscribers {
+                // we don't really care if this succeeds or fails as we are closing/dropping these
+                let _ = subscriber.send(Message::Close(None).into()).await;
             }
         }
     }
