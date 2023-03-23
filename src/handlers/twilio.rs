@@ -17,8 +17,10 @@ use futures::{
     stream::{SplitSink, SplitStream, StreamExt},
 };
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 use std::{convert::From, sync::Arc};
 use tokio::net::TcpStream;
+use tokio::time::timeout;
 use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -158,13 +160,21 @@ async fn handle_from_deepgram_ws(
 
                 println!("about to make chatgpt request: {:?}", chatgpt_request);
                 let chatgpt_client = reqwest::Client::new();
-                if let Ok(chatgpt_response) = chatgpt_client
-                    .post("https://api.openai.com/v1/chat/completions")
-                    .bearer_auth(chatgpt_api_key.clone())
-                    .json(&chatgpt_request)
-                    .send()
-                    .await
-                {
+                let mut chatgpt_response = None;
+                loop {
+                    println!("trying to make the chatgpt request");
+                    let chatgpt_future = chatgpt_client
+                        .post("https://api.openai.com/v1/chat/completions")
+                        .bearer_auth(chatgpt_api_key.clone())
+                        .json(&chatgpt_request)
+                        .send();
+                    if let Ok(response) = timeout(Duration::from_millis(5000), chatgpt_future).await
+                    {
+                        chatgpt_response = Some(response);
+                        break;
+                    }
+                }
+                if let Some(Ok(chatgpt_response)) = chatgpt_response {
                     if let Ok(chatgpt_response) = chatgpt_response.json::<ChatGPTResponse>().await {
                         println!("got chatgpt response: {:?}", chatgpt_response);
                         chatgpt_messages.push(chatgpt_response.choices[0].message.clone());
