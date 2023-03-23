@@ -1,5 +1,4 @@
 use crate::audio;
-use crate::cleverbot_response;
 use crate::deepgram_response;
 use crate::message::Message;
 use crate::state::State;
@@ -17,9 +16,45 @@ use futures::{
     sink::SinkExt,
     stream::{SplitSink, SplitStream, StreamExt},
 };
+use serde::{Deserialize, Serialize};
 use std::{convert::From, sync::Arc};
 use tokio::net::TcpStream;
 use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ChatGPTRequest {
+    model: String,
+    messages: Vec<ChatGPTMessage>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ChatGPTMessage {
+    role: String,
+    content: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ChatGPTResponse {
+    id: String,
+    object: String,
+    created: u64,
+    choices: Vec<ChatGPTChoice>,
+    usage: ChatGPTUsage,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ChatGPTUsage {
+    prompt_tokens: usize,
+    completion_tokens: usize,
+    total_tokens: usize,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ChatGPTChoice {
+    index: usize,
+    message: ChatGPTMessage,
+    finish_reason: String,
+}
 
 pub async fn twilio_handler(
     ws: WebSocketUpgrade,
@@ -29,6 +64,7 @@ pub async fn twilio_handler(
 }
 
 async fn handle_socket(socket: WebSocket, state: Arc<State>) {
+    println!("twilio.rs handle_socket");
     let (this_sender, this_receiver) = socket.split();
 
     // prepare the deepgram connection request with the api key authentication
@@ -52,12 +88,14 @@ async fn handle_socket(socket: WebSocket, state: Arc<State>) {
         deepgram_reader,
         this_sender,
         streamsid_rx,
-        state.cleverbot_api_key.clone(),
+        state.chatgpt_api_key.clone(),
+        Arc::clone(&state),
     ));
     tokio::spawn(handle_from_twilio_ws(
         this_receiver,
         deepgram_sender,
         streamsid_tx,
+        Arc::clone(&state),
     ));
 }
 
@@ -65,15 +103,25 @@ async fn handle_from_deepgram_ws(
     mut deepgram_receiver: SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>,
     mut twilio_sender: SplitSink<WebSocket, axum::extract::ws::Message>,
     streamsid_rx: oneshot::Receiver<String>,
-    cleverbot_api_key: String,
+    chatgpt_api_key: String,
+    state: Arc<State>,
 ) {
+    println!("handle_from_deepgram_ws");
     let streamsid = streamsid_rx
         .await
         .expect("Failed to receive streamsid from handle_from_twilio_ws.");
 
-    let mut cleverbot_cs = None;
+    let mut chatgpt_messages = Vec::new();
+    chatgpt_messages.push(ChatGPTMessage {
+        role: "system".to_string(),
+        content:
+            "You work at a pizza shop answering phone calls from customers trying to order pizza."
+                .to_string(),
+    });
 
     while let Some(Ok(msg)) = deepgram_receiver.next().await {
+        println!("message from deepgram: {:?}", msg.clone());
+        let mut chatgpt_messages = chatgpt_messages.clone();
         if let tungstenite::Message::Text(msg) = msg.clone() {
             let deepgram_response: Result<deepgram_response::StreamingResponse, _> =
                 serde_json::from_str(&msg);
@@ -84,22 +132,28 @@ async fn handle_from_deepgram_ws(
 
                 let transcript = deepgram_response.channel.alternatives[0].transcript.clone();
 
-                let mut cleverbot_url = format!(
-                    "https://www.cleverbot.com/getreply?key={}",
-                    cleverbot_api_key
-                );
+                chatgpt_messages.push(ChatGPTMessage {
+                    role: "user".to_string(),
+                    content: transcript.clone(),
+                });
 
-                if let Some(cs) = cleverbot_cs.clone() {
-                    cleverbot_url = format!("{}&cs={}", cleverbot_url, cs);
-                }
-                cleverbot_url = format!("{}&input={}", cleverbot_url, transcript);
+                let chatgpt_request = ChatGPTRequest {
+                    model: "gpt-3.5-turbo".to_string(),
+                    messages: chatgpt_messages.clone(),
+                };
 
-                if let Ok(cleverbot_response) = reqwest::get(cleverbot_url).await {
-                    if let Ok(cleverbot_response) = cleverbot_response
-                        .json::<cleverbot_response::CleverbotResponse>()
-                        .await
-                    {
-                        cleverbot_cs = Some(cleverbot_response.cs);
+                println!("about to make chatgpt request");
+                let chatgpt_client = reqwest::Client::new();
+                if let Ok(chatgpt_response) = chatgpt_client
+                    .post("https://api.openai.com/v1/chat/completions")
+                    .bearer_auth(chatgpt_api_key.clone())
+                    .json(&chatgpt_request)
+                    .send()
+                    .await
+                {
+                    if let Ok(chatgpt_response) = chatgpt_response.json::<ChatGPTResponse>().await {
+                        println!("got chatgpt response: {:?}", chatgpt_response);
+                        chatgpt_messages.push(chatgpt_response.choices[0].message.clone());
 
                         let shared_config = aws_config::from_env().load().await;
                         let client = Client::new(&shared_config);
@@ -108,7 +162,7 @@ async fn handle_from_deepgram_ws(
                             .synthesize_speech()
                             .output_format(OutputFormat::Pcm)
                             .sample_rate("8000")
-                            .text(cleverbot_response.output)
+                            .text(chatgpt_response.choices[0].message.content.clone())
                             .voice_id(VoiceId::Joanna)
                             .send()
                             .await
@@ -148,6 +202,26 @@ async fn handle_from_deepgram_ws(
                                         .into(),
                                     )
                                     .await;
+
+                                let mut subscribers = state.subscribers.lock().await;
+                                if let Some(subscribers) = subscribers.get_mut(&streamsid) {
+                                    println!("sending deepgram response (only so far) to the subscribers");
+                                    // send the message to all subscribers concurrently
+                                    let futs = subscribers.iter_mut().map(|subscriber| {
+                                        subscriber.send(Message::Text(msg.clone()).into())
+                                    });
+                                    let results = futures::future::join_all(futs).await;
+
+                                    // if we successfully sent a message then the subscriber is still connected
+                                    // other subscribers should be removed
+                                    *subscribers = subscribers
+                                        .drain(..)
+                                        .zip(results)
+                                        .filter_map(|(subscriber, result)| {
+                                            result.is_ok().then_some(subscriber)
+                                        })
+                                        .collect();
+                                }
                             }
                         }
                     }
@@ -164,6 +238,7 @@ async fn handle_from_twilio_ws(
         tokio_tungstenite::tungstenite::Message,
     >,
     streamsid_tx: oneshot::Sender<String>,
+    state: Arc<State>,
 ) {
     let mut buffer_data = audio::BufferData {
         inbound_buffer: Vec::new(),
@@ -186,6 +261,14 @@ async fn handle_from_twilio_ws(
                                 .send(start.stream_sid.clone())
                                 .expect("Failed to send streamsid to handle_to_game_rx.");
                         }
+
+                        // make a new set of subscribers for this call, using the stream sid as the key
+                        state
+                            .subscribers
+                            .lock()
+                            .await
+                            .entry(start.stream_sid)
+                            .or_default();
                     }
                     twilio_response::EventType::Media(media) => {
                         if let Some(audio) = audio::process_twilio_media(media, &mut buffer_data) {

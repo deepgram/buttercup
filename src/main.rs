@@ -1,9 +1,10 @@
 use axum::{routing::get, Extension, Router};
 use axum_server::tls_rustls::RustlsConfig;
+use futures::lock::Mutex;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 mod audio;
-mod cleverbot_response;
 mod deepgram_response;
 mod handlers;
 mod message;
@@ -21,11 +22,8 @@ async fn main() {
     let deepgram_api_key =
         std::env::var("DEEPGRAM_API_KEY").expect("Using this server requires a Deepgram API Key.");
 
-    let cleverbot_api_key = std::env::var("CLEVERBOT_API_KEY")
-        .expect("Using this server requires a Cleverbot API Key.");
-
-    let twilio_phone_number = std::env::var("TWILIO_PHONE_NUMBER")
-        .expect("Using this server requires a Twilio phone number.");
+    let chatgpt_api_key =
+        std::env::var("CHATGPT_API_KEY").expect("Using this server requires a ChatGPT API Key.");
 
     let cert_pem = std::env::var("CERT_PEM").ok();
     let key_pem = std::env::var("KEY_PEM").ok();
@@ -45,12 +43,13 @@ async fn main() {
     let state = Arc::new(state::State {
         deepgram_url,
         deepgram_api_key,
-        cleverbot_api_key,
-        twilio_phone_number,
+        chatgpt_api_key,
+        subscribers: Mutex::new(HashMap::new()),
     });
 
     let app = Router::new()
         .route("/twilio", get(handlers::twilio::twilio_handler))
+        .route("/client", get(handlers::subscriber::subscriber_handler))
         .layer(Extension(state));
 
     match config {
