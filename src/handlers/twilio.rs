@@ -22,6 +22,7 @@ use std::{convert::From, sync::Arc};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
+use serde_json::json;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ChatGPTRequest {
@@ -132,10 +133,40 @@ async fn handle_from_deepgram_ws(
                     continue;
                 }
 
+                {
+                    let mut subscribers = state.subscribers.lock().await;
+                    if let Some(subscribers) = subscribers.get_mut(&streamsid) {
+                        println!("sending deepgram response to the subscribers");
+                        // send the messages to all subscribers concurrently
+                        let futs = subscribers.iter_mut().map(|subscriber| {
+                            subscriber.send(Message::Text(msg.clone()).into())
+                        });
+                        let results = futures::future::join_all(futs).await;
+
+                        // if we successfully sent a message then the subscriber is still connected
+                        // other subscribers should be removed
+                        *subscribers = subscribers
+                            .drain(..)
+                            .zip(results)
+                            .filter_map(|(subscriber, result)| {
+                                result.is_ok().then_some(subscriber)
+                            })
+                            .collect();
+                    }
+                }
+
                 let transcript = deepgram_response.channel.alternatives[0].transcript.clone();
 
                 if !transcript.is_empty() {
                     running_deepgram_response = format!("{running_deepgram_response} {transcript}");
+                    let _ = twilio_sender
+                        .send(
+                            Message::Text(
+                                serde_json::to_string(&json!({ "event": "clear", "streamSid": streamsid })).unwrap(),
+                            )
+                            .into(),
+                        )
+                        .await;
                 }
 
                 if !deepgram_response.speech_final.unwrap_or(false) {
@@ -229,10 +260,15 @@ async fn handle_from_deepgram_ws(
 
                                 let mut subscribers = state.subscribers.lock().await;
                                 if let Some(subscribers) = subscribers.get_mut(&streamsid) {
-                                    println!("sending deepgram response (only so far) to the subscribers");
-                                    // send the message to all subscribers concurrently
+                                    println!("sending chatgpt response to the subscribers");
+                                    // send the messages to all subscribers concurrently
                                     let futs = subscribers.iter_mut().map(|subscriber| {
-                                        subscriber.send(Message::Text(msg.clone()).into())
+                                        subscriber.send(
+                                            Message::Text(
+                                                serde_json::to_string(&chatgpt_response).unwrap(),
+                                            )
+                                            .into(),
+                                        )
                                     });
                                     let results = futures::future::join_all(futs).await;
 
