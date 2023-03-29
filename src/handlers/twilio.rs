@@ -1,5 +1,6 @@
 use crate::audio;
 use crate::deepgram_response;
+use crate::deepgram_response::WrappedStreamingResponse;
 use crate::message::Message;
 use crate::state::State;
 use crate::twilio_response;
@@ -39,7 +40,9 @@ pub struct ChatGPTMessage {
 // this is a quick and dumb wrapper to distinguish between chatgpt responses occuring during
 // the call, and those occuring after the call
 #[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct PostCallChatGPTResponse {
+pub struct WrappedChatGPTResponse {
+    stream_sid: String,
+    post_call: bool,
     chatgpt_response: ChatGPTResponse,
 }
 
@@ -201,9 +204,18 @@ async fn handle_from_deepgram_ws(
                 {
                     println!("sending deepgram response to all subscribers");
                     let mut subscribers = state.subscribers.lock().await;
-                    let futs = subscribers
-                        .iter_mut()
-                        .map(|subscriber| subscriber.send(Message::Text(msg.clone()).into()));
+                    let futs = subscribers.iter_mut().map(|subscriber| {
+                        subscriber.send(
+                            Message::Text(
+                                serde_json::to_string(&WrappedStreamingResponse {
+                                    stream_sid: streamsid.clone(),
+                                    streaming_response: deepgram_response.clone(),
+                                })
+                                .expect("wrapped streaming responses should be serializable"),
+                            )
+                            .into(),
+                        )
+                    });
                     let results = futures::future::join_all(futs).await;
 
                     // if we successfully sent a message then the subscriber is still connected
@@ -333,7 +345,12 @@ async fn handle_from_deepgram_ws(
                                 let futs = subscribers.iter_mut().map(|subscriber| {
                                     subscriber.send(
                                         Message::Text(
-                                            serde_json::to_string(&chatgpt_response).unwrap(),
+                                            serde_json::to_string(&WrappedChatGPTResponse {
+                                                stream_sid: streamsid.clone(),
+                                                post_call: false,
+                                                chatgpt_response: chatgpt_response.clone(),
+                                            })
+                                            .unwrap(),
                                         )
                                         .into(),
                                     )
@@ -398,7 +415,9 @@ async fn handle_from_deepgram_ws(
                 let futs = subscribers.iter_mut().map(|subscriber| {
                     subscriber.send(
                         Message::Text(
-                            serde_json::to_string(&PostCallChatGPTResponse {
+                            serde_json::to_string(&WrappedChatGPTResponse {
+                                stream_sid: streamsid.clone(),
+                                post_call: true,
                                 chatgpt_response: chatgpt_response.clone(),
                             })
                             .unwrap(),

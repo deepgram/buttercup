@@ -15,7 +15,7 @@ async fn main() {
     let proxy_url = std::env::var("PROXY_URL").unwrap_or_else(|_| "127.0.0.1:5000".to_string());
 
     let deepgram_url = std::env::var("DEEPGRAM_URL").unwrap_or_else(|_| {
-        "wss://api.deepgram.com/v1/listen?encoding=mulaw&sample_rate=8000&punctuate=true&tier=enhanced&endpointing=1500".to_string()
+        "wss://api.deepgram.com/v1/listen?encoding=mulaw&sample_rate=8000&punctuate=true&tier=enhanced".to_string()
     });
 
     let deepgram_api_key =
