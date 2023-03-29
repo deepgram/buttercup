@@ -120,10 +120,12 @@ async fn handle_from_deepgram_ws(
         .await
         .expect("Failed to receive streamsid from handle_from_twilio_ws.");
 
+    println!("getting the pre and post call prompts, and the initial message");
     let pre_call_prompt = { state.pre_call_prompt.lock().await.clone() };
     let initial_call_message = { state.initial_call_message.lock().await.clone() };
     let post_call_prompts = { state.post_call_prompts.lock().await.clone() };
 
+    println!("finished getting the pre and post call prompts and initial message");
     let mut chatgpt_messages = Vec::new();
     chatgpt_messages.push(ChatGPTMessage {
         role: "system".to_string(),
@@ -142,6 +144,7 @@ async fn handle_from_deepgram_ws(
     let shared_config = aws_config::from_env().load().await;
     let client = Client::new(&shared_config);
 
+    println!("about to make initial polly request");
     if let Ok(polly_response) = client
         .synthesize_speech()
         .output_format(OutputFormat::Pcm)
@@ -181,6 +184,7 @@ async fn handle_from_deepgram_ws(
         }
     }
     // end of ugly block
+    println!("finished ugly block, including initial polly request");
 
     let mut running_deepgram_response = "".to_string();
 
@@ -190,10 +194,12 @@ async fn handle_from_deepgram_ws(
                 serde_json::from_str(&msg);
             if let Ok(deepgram_response) = deepgram_response {
                 if deepgram_response.channel.alternatives.is_empty() {
+                    println!("empty alternatives");
                     continue;
                 }
 
                 {
+                    println!("sending deepgram response to all subscribers");
                     let mut subscribers = state.subscribers.lock().await;
                     let futs = subscribers
                         .iter_mut()
@@ -212,6 +218,7 @@ async fn handle_from_deepgram_ws(
                 let transcript = deepgram_response.channel.alternatives[0].transcript.clone();
 
                 if !transcript.is_empty() {
+                    println!("our transcript isn't empty, so appending it to our running deepgram transcript");
                     running_deepgram_response = format!("{running_deepgram_response} {transcript}");
                     let _ = twilio_sender
                         .send(
@@ -227,12 +234,16 @@ async fn handle_from_deepgram_ws(
                 }
 
                 if !deepgram_response.speech_final.unwrap_or(false) {
+                    println!("this isn't a speech final result");
                     continue;
                 }
 
                 if running_deepgram_response.is_empty() {
+                    println!("we have a speech final response, but our running deepgram transcript is empty");
                     continue;
                 }
+
+                println!("we have a speech final result, and we have a running deepgram transcript which isn't empty");
 
                 chatgpt_messages.push(ChatGPTMessage {
                     role: "user".to_string(),
