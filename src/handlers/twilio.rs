@@ -36,6 +36,13 @@ pub struct ChatGPTMessage {
     content: String,
 }
 
+// this is a quick and dumb wrapper to distinguish between chatgpt responses occuring during
+// the call, and those occuring after the call
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct PostCallChatGPTResponse {
+    chatgpt_response: ChatGPTResponse,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ChatGPTResponse {
     id: String,
@@ -98,7 +105,6 @@ async fn handle_socket(socket: WebSocket, state: Arc<State>) {
         this_receiver,
         deepgram_sender,
         streamsid_tx,
-        Arc::clone(&state),
     ));
 }
 
@@ -114,23 +120,25 @@ async fn handle_from_deepgram_ws(
         .await
         .expect("Failed to receive streamsid from handle_from_twilio_ws.");
 
+    let pre_call_prompt = { state.pre_call_prompt.lock().await.clone() };
+    let initial_call_message = { state.initial_call_message.lock().await.clone() };
+    let post_call_prompts = { state.post_call_prompts.lock().await.clone() };
+
     let mut chatgpt_messages = Vec::new();
     chatgpt_messages.push(ChatGPTMessage {
         role: "system".to_string(),
-        content:
-            "You work at a pizza shop answering phone calls from customers trying to order pizza."
-                .to_string(),
+        content: pre_call_prompt,
     });
 
+    // what this ugly block informs is that we should have a function for
+    // streaming polly responses to twilio, since there are a number of steps involved
     // beginning of ugly block
-    let initial_assistant_message_string =
-        "Hello, this is Paparazzi's Pizza, what would you like to order?".to_string();
     let initial_assistant_message = ChatGPTMessage {
         role: "assistant".to_string(),
-        content: initial_assistant_message_string.clone(),
+        content: initial_call_message,
     };
 
-    chatgpt_messages.push(initial_assistant_message);
+    chatgpt_messages.push(initial_assistant_message.clone());
     let shared_config = aws_config::from_env().load().await;
     let client = Client::new(&shared_config);
 
@@ -138,7 +146,7 @@ async fn handle_from_deepgram_ws(
         .synthesize_speech()
         .output_format(OutputFormat::Pcm)
         .sample_rate("8000")
-        .text(initial_assistant_message_string.clone())
+        .text(initial_assistant_message.content.clone())
         .voice_id(VoiceId::Joanna)
         .send()
         .await
@@ -187,22 +195,18 @@ async fn handle_from_deepgram_ws(
 
                 {
                     let mut subscribers = state.subscribers.lock().await;
-                    if let Some(subscribers) = subscribers.get_mut(&streamsid) {
-                        println!("sending deepgram response to the subscribers");
-                        // send the messages to all subscribers concurrently
-                        let futs = subscribers
-                            .iter_mut()
-                            .map(|subscriber| subscriber.send(Message::Text(msg.clone()).into()));
-                        let results = futures::future::join_all(futs).await;
+                    let futs = subscribers
+                        .iter_mut()
+                        .map(|subscriber| subscriber.send(Message::Text(msg.clone()).into()));
+                    let results = futures::future::join_all(futs).await;
 
-                        // if we successfully sent a message then the subscriber is still connected
-                        // other subscribers should be removed
-                        *subscribers = subscribers
-                            .drain(..)
-                            .zip(results)
-                            .filter_map(|(subscriber, result)| result.is_ok().then_some(subscriber))
-                            .collect();
-                    }
+                    // if we successfully sent a message then the subscriber is still connected
+                    // other subscribers should be removed
+                    *subscribers = subscribers
+                        .drain(..)
+                        .zip(results)
+                        .filter_map(|(subscriber, result)| result.is_ok().then_some(subscriber))
+                        .collect();
                 }
 
                 let transcript = deepgram_response.channel.alternatives[0].transcript.clone();
@@ -313,33 +317,93 @@ async fn handle_from_deepgram_ws(
                                     .await;
 
                                 let mut subscribers = state.subscribers.lock().await;
-                                if let Some(subscribers) = subscribers.get_mut(&streamsid) {
-                                    println!("sending chatgpt response to the subscribers");
-                                    // send the messages to all subscribers concurrently
-                                    let futs = subscribers.iter_mut().map(|subscriber| {
-                                        subscriber.send(
-                                            Message::Text(
-                                                serde_json::to_string(&chatgpt_response).unwrap(),
-                                            )
-                                            .into(),
+                                println!("sending chatgpt response to the subscribers");
+                                // send the messages to all subscribers concurrently
+                                let futs = subscribers.iter_mut().map(|subscriber| {
+                                    subscriber.send(
+                                        Message::Text(
+                                            serde_json::to_string(&chatgpt_response).unwrap(),
                                         )
-                                    });
-                                    let results = futures::future::join_all(futs).await;
+                                        .into(),
+                                    )
+                                });
+                                let results = futures::future::join_all(futs).await;
 
-                                    // if we successfully sent a message then the subscriber is still connected
-                                    // other subscribers should be removed
-                                    *subscribers = subscribers
-                                        .drain(..)
-                                        .zip(results)
-                                        .filter_map(|(subscriber, result)| {
-                                            result.is_ok().then_some(subscriber)
-                                        })
-                                        .collect();
-                                }
+                                // if we successfully sent a message then the subscriber is still connected
+                                // other subscribers should be removed
+                                *subscribers = subscribers
+                                    .drain(..)
+                                    .zip(results)
+                                    .filter_map(|(subscriber, result)| {
+                                        result.is_ok().then_some(subscriber)
+                                    })
+                                    .collect();
                             }
                         }
                     }
                 }
+            }
+        }
+    }
+
+    // send post call chatgpt responses to post call chatgpt prompts
+    for post_call_prompt in post_call_prompts {
+        chatgpt_messages.push(ChatGPTMessage {
+            role: "user".to_string(),
+            content: post_call_prompt.clone(),
+        });
+
+        let chatgpt_request = ChatGPTRequest {
+            model: "gpt-3.5-turbo".to_string(),
+            messages: chatgpt_messages.clone(),
+        };
+
+        println!(
+            "about to make post call chatgpt request: {:?}",
+            chatgpt_request
+        );
+        let chatgpt_client = reqwest::Client::new();
+        let mut chatgpt_response = None;
+        loop {
+            println!("trying to make the chatgpt request");
+            let chatgpt_future = chatgpt_client
+                .post("https://api.openai.com/v1/chat/completions")
+                .bearer_auth(chatgpt_api_key.clone())
+                .json(&chatgpt_request)
+                .send();
+            if let Ok(response) = timeout(Duration::from_millis(5000), chatgpt_future).await {
+                println!("got chatgpt response: {:?}", response);
+                chatgpt_response = Some(response);
+                break;
+            }
+        }
+        if let Some(Ok(chatgpt_response)) = chatgpt_response {
+            if let Ok(chatgpt_response) = chatgpt_response.json::<ChatGPTResponse>().await {
+                println!("got chatgpt Ok response: {:?}", chatgpt_response);
+                chatgpt_messages.push(chatgpt_response.choices[0].message.clone());
+                let mut subscribers = state.subscribers.lock().await;
+                println!("sending chatgpt response to the subscribers");
+                // send the messages to all subscribers concurrently
+                let futs = subscribers.iter_mut().map(|subscriber| {
+                    subscriber.send(
+                        Message::Text(
+                            serde_json::to_string(&PostCallChatGPTResponse {
+                                chatgpt_response: chatgpt_response.clone(),
+                            })
+                            .unwrap(),
+                        )
+                        .into(),
+                    )
+                });
+                let results = futures::future::join_all(futs).await;
+
+                // if we successfully sent a message then the subscriber is still connected
+                // other subscribers should be removed
+                *subscribers = subscribers
+                    .drain(..)
+                    .zip(results)
+                    .filter_map(|(subscriber, result)| result.is_ok().then_some(subscriber))
+                    .collect();
             }
         }
     }
@@ -352,7 +416,6 @@ async fn handle_from_twilio_ws(
         tokio_tungstenite::tungstenite::Message,
     >,
     streamsid_tx: oneshot::Sender<String>,
-    state: Arc<State>,
 ) {
     let mut buffer_data = audio::BufferData {
         inbound_buffer: Vec::new(),
@@ -361,7 +424,6 @@ async fn handle_from_twilio_ws(
 
     // wrap our oneshot in an Option because we will need it in a loop
     let mut streamsid_tx = Some(streamsid_tx);
-    let mut streamsid: Option<String> = None;
 
     while let Some(Ok(msg)) = this_receiver.next().await {
         let msg = Message::from(msg);
@@ -370,22 +432,12 @@ async fn handle_from_twilio_ws(
             if let Ok(event) = event {
                 match event.event_type {
                     twilio_response::EventType::Start(start) => {
-                        streamsid = Some(start.stream_sid.clone());
-
                         // sending this streamsid on our oneshot will let `handle_from_deepgram_ws` know the streamsid
                         if let Some(streamsid_tx) = streamsid_tx.take() {
                             streamsid_tx
                                 .send(start.stream_sid.clone())
                                 .expect("Failed to send streamsid to handle_to_game_rx.");
                         }
-
-                        // make a new set of subscribers for this call, using the stream sid as the key
-                        state
-                            .subscribers
-                            .lock()
-                            .await
-                            .entry(start.stream_sid)
-                            .or_default();
                     }
                     twilio_response::EventType::Media(media) => {
                         if let Some(audio) = audio::process_twilio_media(media, &mut buffer_data) {
@@ -400,17 +452,6 @@ async fn handle_from_twilio_ws(
                         }
                     }
                 }
-            }
-        }
-    }
-
-    // close and remove the subscribers, if we have a streamsid
-    if let Some(streamsid) = streamsid {
-        let mut subscribers = state.subscribers.lock().await;
-        if let Some(subscribers) = subscribers.remove(&streamsid) {
-            for mut subscriber in subscribers {
-                // we don't really care if this succeeds or fails as we are closing/dropping these
-                let _ = subscriber.send(Message::Close(None).into()).await;
             }
         }
     }

@@ -1,7 +1,6 @@
 use axum::{routing::get, Extension, Router};
 use axum_server::tls_rustls::RustlsConfig;
 use futures::lock::Mutex;
-use std::collections::HashMap;
 use std::sync::Arc;
 
 mod audio;
@@ -40,11 +39,22 @@ async fn main() {
         }
     };
 
+    let pre_call_prompt = Mutex::new("You work at a pizza shop called Paparazzi's answering phone calls from customers trying to order pizza. You only offer delivery, and you need to get the customer's address.".to_string());
+    let initial_call_message =
+        Mutex::new("Hello, this is Paparazzi's, what would you like to order?".to_string());
+    let post_call_prompts = Mutex::new(vec![
+        "What did the customer order?".to_string(),
+        "What is the customer's address?".to_string(),
+    ]);
+
     let state = Arc::new(state::State {
         deepgram_url,
         deepgram_api_key,
         chatgpt_api_key,
-        subscribers: Mutex::new(HashMap::new()),
+        subscribers: Mutex::new(Vec::new()),
+        pre_call_prompt,
+        initial_call_message,
+        post_call_prompts,
     });
 
     let app = Router::new()
