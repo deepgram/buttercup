@@ -1,4 +1,5 @@
-use axum::{routing::get, Extension, Router};
+use axum::routing::{get, post};
+use axum::{Extension, Router};
 use axum_server::tls_rustls::RustlsConfig;
 use futures::lock::Mutex;
 use std::sync::Arc;
@@ -60,6 +61,30 @@ async fn main() {
     let app = Router::new()
         .route("/twilio", get(handlers::twilio::twilio_handler))
         .route("/client", get(handlers::subscriber::subscriber_handler))
+        .route(
+            "/pre-call-prompt",
+            get(handlers::prompts::get_pre_call_prompt),
+        )
+        .route(
+            "/initial-call-message",
+            get(handlers::prompts::get_initial_call_message),
+        )
+        .route(
+            "/post-call-prompts",
+            get(handlers::prompts::get_post_call_prompts),
+        )
+        .route(
+            "/pre-call-prompt",
+            post(handlers::prompts::post_pre_call_prompt),
+        )
+        .route(
+            "/initial-call-message",
+            post(handlers::prompts::post_initial_call_message),
+        )
+        .route(
+            "/post-call-prompts",
+            post(handlers::prompts::post_post_call_prompts),
+        )
         .layer(Extension(state));
 
     match config {
