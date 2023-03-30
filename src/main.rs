@@ -3,6 +3,7 @@ use axum::{Extension, Router};
 use axum_server::tls_rustls::RustlsConfig;
 use futures::lock::Mutex;
 use std::sync::Arc;
+use tower_http::cors::CorsLayer;
 
 mod audio;
 mod deepgram_response;
@@ -85,6 +86,7 @@ async fn main() {
             "/post-call-prompts",
             post(handlers::prompts::post_post_call_prompts),
         )
+        .layer(CorsLayer::permissive())
         .layer(Extension(state));
 
     match config {
