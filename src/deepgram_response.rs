@@ -36,3 +36,9 @@ pub struct Word {
     pub end: f32,
     pub confidence: f32,
 }
+
+#[derive(Serialize, Deserialize, Clone, Default, PartialEq, Debug)]
+pub struct ServerMessageOrSo {
+    #[serde(rename = "type")]
+    pub the_type: String, // TODO: make this an enum with `UtteranceEnd` as a variant
+}

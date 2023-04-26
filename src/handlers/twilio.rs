@@ -193,11 +193,151 @@ async fn handle_from_deepgram_ws(
 
     while let Some(Ok(msg)) = deepgram_receiver.next().await {
         if let tungstenite::Message::Text(msg) = msg.clone() {
+            println!("Got a message from Deepgram:");
+            println!("{:?}", msg);
+
+            // if the message was an utterance end message:
+            if let Ok(server_message_or_so) =
+                serde_json::from_str::<deepgram_response::ServerMessageOrSo>(&msg)
+            {
+                if server_message_or_so.the_type == "UtteranceEnd" {
+                    println!("Got an utterance end message, so will interact with ChatGPT now.");
+
+                    if running_deepgram_response.is_empty() {
+                        println!("our running deepgram transcript is empty, so will not interact with ChatGPT");
+                        continue;
+                    }
+
+                    chatgpt_messages.push(ChatGPTMessage {
+                        role: "user".to_string(),
+                        content: running_deepgram_response.clone(),
+                    });
+
+                    running_deepgram_response = "".to_string();
+
+                    let chatgpt_request = ChatGPTRequest {
+                        model: "gpt-3.5-turbo".to_string(),
+                        messages: chatgpt_messages.clone(),
+                    };
+
+                    println!("about to make chatgpt request: {:?}", chatgpt_request);
+                    let chatgpt_client = reqwest::Client::new();
+                    let mut chatgpt_response = None;
+                    loop {
+                        println!("trying to make the chatgpt request");
+                        let chatgpt_future = chatgpt_client
+                            .post("https://api.openai.com/v1/chat/completions")
+                            .bearer_auth(chatgpt_api_key.clone())
+                            .json(&chatgpt_request)
+                            .send();
+                        if let Ok(response) =
+                            timeout(Duration::from_millis(5000), chatgpt_future).await
+                        {
+                            println!("got chatgpt response: {:?}", response);
+                            chatgpt_response = Some(response);
+                            break;
+                        }
+                    }
+                    if let Some(Ok(chatgpt_response)) = chatgpt_response {
+                        if let Ok(chatgpt_response) =
+                            chatgpt_response.json::<ChatGPTResponse>().await
+                        {
+                            println!("got chatgpt Ok response: {:?}", chatgpt_response);
+                            chatgpt_messages.push(chatgpt_response.choices[0].message.clone());
+
+                            let shared_config = aws_config::from_env().load().await;
+                            let client = Client::new(&shared_config);
+
+                            if let Ok(polly_response) = client
+                                .synthesize_speech()
+                                .output_format(OutputFormat::Pcm)
+                                .sample_rate("8000")
+                                .text(chatgpt_response.choices[0].message.content.clone())
+                                .voice_id(VoiceId::Joanna)
+                                .send()
+                                .await
+                            {
+                                if let Ok(pcm) = polly_response
+                                    .audio_stream
+                                    .collect()
+                                    .await
+                                    .map(|aggregated_bytes| aggregated_bytes.to_vec())
+                                {
+                                    let mut i16_samples = Vec::new();
+                                    for i in 0..(pcm.len() / 2) {
+                                        let mut i16_sample = pcm[i * 2] as i16;
+                                        i16_sample |= ((pcm[i * 2 + 1]) as i16) << 8;
+                                        i16_samples.push(i16_sample);
+                                    }
+
+                                    let mut mulaw_samples = Vec::new();
+                                    for sample in i16_samples {
+                                        mulaw_samples.push(audio::linear_to_ulaw(sample));
+                                    }
+
+                                    // base64 encode the mulaw, wrap it in a Twilio media message, and send it to Twilio
+                                    let base64_encoded_mulaw =
+                                        general_purpose::STANDARD.encode(&mulaw_samples);
+
+                                    let sending_media = twilio_response::SendingMedia::new(
+                                        streamsid.clone(),
+                                        base64_encoded_mulaw,
+                                    );
+
+                                    let _ = twilio_sender
+                                        .send(
+                                            Message::Text(
+                                                serde_json::to_string(&sending_media).unwrap(),
+                                            )
+                                            .into(),
+                                        )
+                                        .await;
+
+                                    let mut subscribers = state.subscribers.lock().await;
+                                    println!("sending chatgpt response to the subscribers");
+                                    // send the messages to all subscribers concurrently
+                                    let futs = subscribers.iter_mut().map(|subscriber| {
+                                        subscriber.send(
+                                            Message::Text(
+                                                serde_json::to_string(&WrappedChatGPTResponse {
+                                                    stream_sid: streamsid.clone(),
+                                                    post_call: false,
+                                                    chatgpt_response: chatgpt_response.clone(),
+                                                })
+                                                .unwrap(),
+                                            )
+                                            .into(),
+                                        )
+                                    });
+                                    let results = futures::future::join_all(futs).await;
+
+                                    // if we successfully sent a message then the subscriber is still connected
+                                    // other subscribers should be removed
+                                    *subscribers = subscribers
+                                        .drain(..)
+                                        .zip(results)
+                                        .filter_map(|(subscriber, result)| {
+                                            result.is_ok().then_some(subscriber)
+                                        })
+                                        .collect();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // otherwise, if our message was an ASR message:
             let deepgram_response: Result<deepgram_response::StreamingResponse, _> =
                 serde_json::from_str(&msg);
             if let Ok(deepgram_response) = deepgram_response {
                 if deepgram_response.channel.alternatives.is_empty() {
                     println!("empty alternatives");
+                    continue;
+                }
+
+                if !deepgram_response.is_final {
+                    println!("not a final response");
                     continue;
                 }
 
@@ -243,132 +383,6 @@ async fn handle_from_deepgram_ws(
                             .into(),
                         )
                         .await;
-                }
-
-                if !deepgram_response.speech_final.unwrap_or(false) {
-                    println!("this isn't a speech final result");
-                    continue;
-                }
-
-                if running_deepgram_response.is_empty() {
-                    println!("we have a speech final response, but our running deepgram transcript is empty");
-                    continue;
-                }
-
-                println!("we have a speech final result, and we have a running deepgram transcript which isn't empty");
-
-                chatgpt_messages.push(ChatGPTMessage {
-                    role: "user".to_string(),
-                    content: running_deepgram_response.clone(),
-                });
-
-                running_deepgram_response = "".to_string();
-
-                let chatgpt_request = ChatGPTRequest {
-                    model: "gpt-3.5-turbo".to_string(),
-                    messages: chatgpt_messages.clone(),
-                };
-
-                println!("about to make chatgpt request: {:?}", chatgpt_request);
-                let chatgpt_client = reqwest::Client::new();
-                let mut chatgpt_response = None;
-                loop {
-                    println!("trying to make the chatgpt request");
-                    let chatgpt_future = chatgpt_client
-                        .post("https://api.openai.com/v1/chat/completions")
-                        .bearer_auth(chatgpt_api_key.clone())
-                        .json(&chatgpt_request)
-                        .send();
-                    if let Ok(response) = timeout(Duration::from_millis(5000), chatgpt_future).await
-                    {
-                        println!("got chatgpt response: {:?}", response);
-                        chatgpt_response = Some(response);
-                        break;
-                    }
-                }
-                if let Some(Ok(chatgpt_response)) = chatgpt_response {
-                    if let Ok(chatgpt_response) = chatgpt_response.json::<ChatGPTResponse>().await {
-                        println!("got chatgpt Ok response: {:?}", chatgpt_response);
-                        chatgpt_messages.push(chatgpt_response.choices[0].message.clone());
-
-                        let shared_config = aws_config::from_env().load().await;
-                        let client = Client::new(&shared_config);
-
-                        if let Ok(polly_response) = client
-                            .synthesize_speech()
-                            .output_format(OutputFormat::Pcm)
-                            .sample_rate("8000")
-                            .text(chatgpt_response.choices[0].message.content.clone())
-                            .voice_id(VoiceId::Joanna)
-                            .send()
-                            .await
-                        {
-                            if let Ok(pcm) = polly_response
-                                .audio_stream
-                                .collect()
-                                .await
-                                .map(|aggregated_bytes| aggregated_bytes.to_vec())
-                            {
-                                let mut i16_samples = Vec::new();
-                                for i in 0..(pcm.len() / 2) {
-                                    let mut i16_sample = pcm[i * 2] as i16;
-                                    i16_sample |= ((pcm[i * 2 + 1]) as i16) << 8;
-                                    i16_samples.push(i16_sample);
-                                }
-
-                                let mut mulaw_samples = Vec::new();
-                                for sample in i16_samples {
-                                    mulaw_samples.push(audio::linear_to_ulaw(sample));
-                                }
-
-                                // base64 encode the mulaw, wrap it in a Twilio media message, and send it to Twilio
-                                let base64_encoded_mulaw =
-                                    general_purpose::STANDARD.encode(&mulaw_samples);
-
-                                let sending_media = twilio_response::SendingMedia::new(
-                                    streamsid.clone(),
-                                    base64_encoded_mulaw,
-                                );
-
-                                let _ = twilio_sender
-                                    .send(
-                                        Message::Text(
-                                            serde_json::to_string(&sending_media).unwrap(),
-                                        )
-                                        .into(),
-                                    )
-                                    .await;
-
-                                let mut subscribers = state.subscribers.lock().await;
-                                println!("sending chatgpt response to the subscribers");
-                                // send the messages to all subscribers concurrently
-                                let futs = subscribers.iter_mut().map(|subscriber| {
-                                    subscriber.send(
-                                        Message::Text(
-                                            serde_json::to_string(&WrappedChatGPTResponse {
-                                                stream_sid: streamsid.clone(),
-                                                post_call: false,
-                                                chatgpt_response: chatgpt_response.clone(),
-                                            })
-                                            .unwrap(),
-                                        )
-                                        .into(),
-                                    )
-                                });
-                                let results = futures::future::join_all(futs).await;
-
-                                // if we successfully sent a message then the subscriber is still connected
-                                // other subscribers should be removed
-                                *subscribers = subscribers
-                                    .drain(..)
-                                    .zip(results)
-                                    .filter_map(|(subscriber, result)| {
-                                        result.is_ok().then_some(subscriber)
-                                    })
-                                    .collect();
-                            }
-                        }
-                    }
                 }
             }
         }
