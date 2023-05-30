@@ -88,3 +88,14 @@ pub fn linear_to_ulaw(sample: i16) -> u8 {
     let ulaw_value = sign | exponent << 4 | manitssa;
     (!ulaw_value) as u8
 }
+
+pub fn f32_to_i16(sample: f32) -> i16 {
+    let sample = sample * 32768.0;
+    if sample > 32767.0 {
+        return 32767;
+    }
+    if sample < -32768.0 {
+        return -32768;
+    }
+    sample as i16
+}

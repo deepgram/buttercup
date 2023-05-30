@@ -10,6 +10,7 @@ mod deepgram_response;
 mod handlers;
 mod message;
 mod state;
+mod tts;
 mod twilio_response;
 
 #[tokio::main]

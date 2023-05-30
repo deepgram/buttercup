@@ -3,15 +3,13 @@ use crate::deepgram_response;
 use crate::deepgram_response::WrappedStreamingResponse;
 use crate::message::Message;
 use crate::state::State;
+use crate::tts;
 use crate::twilio_response;
-use aws_sdk_polly::model::{OutputFormat, VoiceId};
-use aws_sdk_polly::Client;
 use axum::{
     extract::ws::{WebSocket, WebSocketUpgrade},
     response::IntoResponse,
     Extension,
 };
-use base64::{engine::general_purpose, Engine};
 use futures::channel::oneshot;
 use futures::{
     sink::SinkExt,
@@ -136,7 +134,7 @@ async fn handle_from_deepgram_ws(
     });
 
     // what this ugly block informs is that we should have a function for
-    // streaming polly responses to twilio, since there are a number of steps involved
+    // streaming tts responses to twilio, since there are a number of steps involved
     // beginning of ugly block
     let initial_assistant_message = ChatGPTMessage {
         role: "assistant".to_string(),
@@ -144,50 +142,16 @@ async fn handle_from_deepgram_ws(
     };
 
     chatgpt_messages.push(initial_assistant_message.clone());
-    let shared_config = aws_config::from_env().load().await;
-    let client = Client::new(&shared_config);
 
-    println!("about to make initial polly request");
-    if let Ok(polly_response) = client
-        .synthesize_speech()
-        .output_format(OutputFormat::Pcm)
-        .sample_rate("8000")
-        .text(initial_assistant_message.content.clone())
-        .voice_id(VoiceId::Joanna)
-        .send()
-        .await
-    {
-        if let Ok(pcm) = polly_response
-            .audio_stream
-            .collect()
-            .await
-            .map(|aggregated_bytes| aggregated_bytes.to_vec())
-        {
-            let mut i16_samples = Vec::new();
-            for i in 0..(pcm.len() / 2) {
-                let mut i16_sample = pcm[i * 2] as i16;
-                i16_sample |= ((pcm[i * 2 + 1]) as i16) << 8;
-                i16_samples.push(i16_sample);
-            }
-
-            let mut mulaw_samples = Vec::new();
-            for sample in i16_samples {
-                mulaw_samples.push(audio::linear_to_ulaw(sample));
-            }
-
-            // base64 encode the mulaw, wrap it in a Twilio media message, and send it to Twilio
-            let base64_encoded_mulaw = general_purpose::STANDARD.encode(&mulaw_samples);
-
-            let sending_media =
-                twilio_response::SendingMedia::new(streamsid.clone(), base64_encoded_mulaw);
-
-            let _ = twilio_sender
-                .send(Message::Text(serde_json::to_string(&sending_media).unwrap()).into())
-                .await;
-        }
-    }
+    println!("about to make initial tts request");
+    let base64_encoded_mulaw =
+        tts::text_to_speech(initial_assistant_message.content.clone(), state.clone()).await;
+    let sending_media = twilio_response::SendingMedia::new(streamsid.clone(), base64_encoded_mulaw);
+    let _ = twilio_sender
+        .send(Message::Text(serde_json::to_string(&sending_media).unwrap()).into())
+        .await;
     // end of ugly block
-    println!("finished ugly block, including initial polly request");
+    println!("finished ugly block, including initial tts request");
 
     let mut running_deepgram_response = "".to_string();
 
@@ -245,83 +209,50 @@ async fn handle_from_deepgram_ws(
                             println!("got chatgpt Ok response: {:?}", chatgpt_response);
                             chatgpt_messages.push(chatgpt_response.choices[0].message.clone());
 
-                            let shared_config = aws_config::from_env().load().await;
-                            let client = Client::new(&shared_config);
+                            let base64_encoded_mulaw = tts::text_to_speech(
+                                chatgpt_response.choices[0].message.content.clone(),
+                                state.clone(),
+                            )
+                            .await;
+                            let sending_media = twilio_response::SendingMedia::new(
+                                streamsid.clone(),
+                                base64_encoded_mulaw,
+                            );
 
-                            if let Ok(polly_response) = client
-                                .synthesize_speech()
-                                .output_format(OutputFormat::Pcm)
-                                .sample_rate("8000")
-                                .text(chatgpt_response.choices[0].message.content.clone())
-                                .voice_id(VoiceId::Joanna)
-                                .send()
-                                .await
-                            {
-                                if let Ok(pcm) = polly_response
-                                    .audio_stream
-                                    .collect()
-                                    .await
-                                    .map(|aggregated_bytes| aggregated_bytes.to_vec())
-                                {
-                                    let mut i16_samples = Vec::new();
-                                    for i in 0..(pcm.len() / 2) {
-                                        let mut i16_sample = pcm[i * 2] as i16;
-                                        i16_sample |= ((pcm[i * 2 + 1]) as i16) << 8;
-                                        i16_samples.push(i16_sample);
-                                    }
+                            let _ = twilio_sender
+                                .send(
+                                    Message::Text(serde_json::to_string(&sending_media).unwrap())
+                                        .into(),
+                                )
+                                .await;
 
-                                    let mut mulaw_samples = Vec::new();
-                                    for sample in i16_samples {
-                                        mulaw_samples.push(audio::linear_to_ulaw(sample));
-                                    }
-
-                                    // base64 encode the mulaw, wrap it in a Twilio media message, and send it to Twilio
-                                    let base64_encoded_mulaw =
-                                        general_purpose::STANDARD.encode(&mulaw_samples);
-
-                                    let sending_media = twilio_response::SendingMedia::new(
-                                        streamsid.clone(),
-                                        base64_encoded_mulaw,
-                                    );
-
-                                    let _ = twilio_sender
-                                        .send(
-                                            Message::Text(
-                                                serde_json::to_string(&sending_media).unwrap(),
-                                            )
-                                            .into(),
-                                        )
-                                        .await;
-
-                                    let mut subscribers = state.subscribers.lock().await;
-                                    println!("sending chatgpt response to the subscribers");
-                                    // send the messages to all subscribers concurrently
-                                    let futs = subscribers.iter_mut().map(|subscriber| {
-                                        subscriber.send(
-                                            Message::Text(
-                                                serde_json::to_string(&WrappedChatGPTResponse {
-                                                    stream_sid: streamsid.clone(),
-                                                    post_call: false,
-                                                    chatgpt_response: chatgpt_response.clone(),
-                                                })
-                                                .unwrap(),
-                                            )
-                                            .into(),
-                                        )
-                                    });
-                                    let results = futures::future::join_all(futs).await;
-
-                                    // if we successfully sent a message then the subscriber is still connected
-                                    // other subscribers should be removed
-                                    *subscribers = subscribers
-                                        .drain(..)
-                                        .zip(results)
-                                        .filter_map(|(subscriber, result)| {
-                                            result.is_ok().then_some(subscriber)
+                            let mut subscribers = state.subscribers.lock().await;
+                            println!("sending chatgpt response to the subscribers");
+                            // send the messages to all subscribers concurrently
+                            let futs = subscribers.iter_mut().map(|subscriber| {
+                                subscriber.send(
+                                    Message::Text(
+                                        serde_json::to_string(&WrappedChatGPTResponse {
+                                            stream_sid: streamsid.clone(),
+                                            post_call: false,
+                                            chatgpt_response: chatgpt_response.clone(),
                                         })
-                                        .collect();
-                                }
-                            }
+                                        .unwrap(),
+                                    )
+                                    .into(),
+                                )
+                            });
+                            let results = futures::future::join_all(futs).await;
+
+                            // if we successfully sent a message then the subscriber is still connected
+                            // other subscribers should be removed
+                            *subscribers = subscribers
+                                .drain(..)
+                                .zip(results)
+                                .filter_map(|(subscriber, result)| {
+                                    result.is_ok().then_some(subscriber)
+                                })
+                                .collect();
                         }
                     }
                 }
