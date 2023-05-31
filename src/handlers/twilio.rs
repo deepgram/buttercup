@@ -42,11 +42,12 @@ async fn handle_socket(socket: WebSocket, state: Arc<State>) {
         .expect("Failed to build a connection request to Deepgram.");
 
     // connect to deepgram
-    println!("connecting to Deepgram");
+    println!("{:?} connecting to Deepgram", chrono::Utc::now());
     let (deepgram_socket, _) = connect_async(request)
         .await
         .expect("Failed to connect to Deepgram.");
-    println!("connected to Deepgram");
+    println!("{:?} connected to Deepgram", chrono::Utc::now());
+
     let (deepgram_sender, deepgram_reader) = deepgram_socket.split();
 
     let (streamsid_tx, streamsid_rx) = oneshot::channel::<String>();
@@ -112,9 +113,6 @@ async fn handle_from_deepgram_ws(
 
     while let Some(Ok(msg)) = deepgram_receiver.next().await {
         if let tungstenite::Message::Text(msg) = msg.clone() {
-            println!("Got a message from Deepgram:");
-            println!("{:?}", msg);
-
             // if the message was an utterance end message:
             if let Ok(server_message_or_so) =
                 serde_json::from_str::<deepgram_response::ServerMessageOrSo>(&msg)
@@ -123,7 +121,6 @@ async fn handle_from_deepgram_ws(
                     println!("Got an utterance end message, so will interact with the LLM now.");
 
                     if running_deepgram_response.is_empty() {
-                        println!("our running deepgram transcript is empty, so will not interact with the LLM");
                         continue;
                     }
 
@@ -138,7 +135,7 @@ async fn handle_from_deepgram_ws(
                         text: llm_messages.clone(),
                     };
 
-                    println!("about to make llm request: {:?}", llm_request);
+                    println!("{:?} about to make llm request", chrono::Utc::now());
                     let llm_client = reqwest::Client::new();
                     let llm_response: llm::LlmResponse = llm_client
                         .post("https://llm.sandbox.deepgram.com/deepchat")
@@ -149,14 +146,18 @@ async fn handle_from_deepgram_ws(
                         .json()
                         .await
                         .expect("unable to parse llm response as json");
+                    println!("{:?} got llm response", chrono::Utc::now());
 
                     llm_messages.push(llm::LlmMessage {
                         role: "assistant".to_string(),
                         content: llm_response.results.clone(),
                     });
 
+                    println!("{:?} about to make tts request", chrono::Utc::now());
                     let base64_encoded_mulaw =
                         tts::text_to_speech(llm_response.results.clone(), state.clone()).await;
+                    println!("{:?} got tts response", chrono::Utc::now());
+
                     let sending_media =
                         twilio_response::SendingMedia::new(streamsid.clone(), base64_encoded_mulaw);
 
@@ -197,17 +198,14 @@ async fn handle_from_deepgram_ws(
                 serde_json::from_str(&msg);
             if let Ok(deepgram_response) = deepgram_response {
                 if deepgram_response.channel.alternatives.is_empty() {
-                    println!("empty alternatives");
                     continue;
                 }
 
                 if !deepgram_response.is_final {
-                    println!("not a final response");
                     continue;
                 }
 
                 {
-                    println!("sending deepgram response to all subscribers");
                     let mut subscribers = state.subscribers.lock().await;
                     let futs = subscribers.iter_mut().map(|subscriber| {
                         subscriber.send(
