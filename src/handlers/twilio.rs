@@ -1,6 +1,7 @@
 use crate::audio;
 use crate::deepgram_response;
 use crate::deepgram_response::WrappedStreamingResponse;
+use crate::llm;
 use crate::message::Message;
 use crate::state::State;
 use crate::tts;
@@ -15,57 +16,10 @@ use futures::{
     sink::SinkExt,
     stream::{SplitSink, SplitStream, StreamExt},
 };
-use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::time::Duration;
 use std::{convert::From, sync::Arc};
 use tokio::net::TcpStream;
-use tokio::time::timeout;
 use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
-
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct ChatGPTRequest {
-    model: String,
-    messages: Vec<ChatGPTMessage>,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct ChatGPTMessage {
-    role: String,
-    content: String,
-}
-
-// this is a quick and dumb wrapper to distinguish between chatgpt responses occuring during
-// the call, and those occuring after the call
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct WrappedChatGPTResponse {
-    stream_sid: String,
-    post_call: bool,
-    chatgpt_response: ChatGPTResponse,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct ChatGPTResponse {
-    id: String,
-    object: String,
-    created: u64,
-    choices: Vec<ChatGPTChoice>,
-    usage: ChatGPTUsage,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct ChatGPTUsage {
-    prompt_tokens: usize,
-    completion_tokens: usize,
-    total_tokens: usize,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct ChatGPTChoice {
-    index: usize,
-    message: ChatGPTMessage,
-    finish_reason: String,
-}
 
 pub async fn twilio_handler(
     ws: WebSocketUpgrade,
@@ -88,18 +42,20 @@ async fn handle_socket(socket: WebSocket, state: Arc<State>) {
         .expect("Failed to build a connection request to Deepgram.");
 
     // connect to deepgram
+    println!("connecting to Deepgram");
     let (deepgram_socket, _) = connect_async(request)
         .await
         .expect("Failed to connect to Deepgram.");
+    println!("connected to Deepgram");
     let (deepgram_sender, deepgram_reader) = deepgram_socket.split();
 
     let (streamsid_tx, streamsid_rx) = oneshot::channel::<String>();
 
+    println!("about to spawn the main tasks");
     tokio::spawn(handle_from_deepgram_ws(
         deepgram_reader,
         this_sender,
         streamsid_rx,
-        state.chatgpt_api_key.clone(),
         Arc::clone(&state),
     ));
     tokio::spawn(handle_from_twilio_ws(
@@ -113,7 +69,6 @@ async fn handle_from_deepgram_ws(
     mut deepgram_receiver: SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>,
     mut twilio_sender: SplitSink<WebSocket, axum::extract::ws::Message>,
     streamsid_rx: oneshot::Receiver<String>,
-    chatgpt_api_key: String,
     state: Arc<State>,
 ) {
     println!("handle_from_deepgram_ws");
@@ -127,21 +82,21 @@ async fn handle_from_deepgram_ws(
     let post_call_prompts = { state.post_call_prompts.lock().await.clone() };
 
     println!("finished getting the pre and post call prompts and initial message");
-    let mut chatgpt_messages = Vec::new();
-    chatgpt_messages.push(ChatGPTMessage {
-        role: "system".to_string(),
+    let mut llm_messages = Vec::new();
+    llm_messages.push(llm::LlmMessage {
+        role: "user".to_string(),
         content: pre_call_prompt,
     });
 
     // what this ugly block informs is that we should have a function for
     // streaming tts responses to twilio, since there are a number of steps involved
     // beginning of ugly block
-    let initial_assistant_message = ChatGPTMessage {
+    let initial_assistant_message = llm::LlmMessage {
         role: "assistant".to_string(),
         content: initial_call_message,
     };
 
-    chatgpt_messages.push(initial_assistant_message.clone());
+    llm_messages.push(initial_assistant_message.clone());
 
     println!("about to make initial tts request");
     let base64_encoded_mulaw =
@@ -165,96 +120,75 @@ async fn handle_from_deepgram_ws(
                 serde_json::from_str::<deepgram_response::ServerMessageOrSo>(&msg)
             {
                 if server_message_or_so.the_type == "UtteranceEnd" {
-                    println!("Got an utterance end message, so will interact with ChatGPT now.");
+                    println!("Got an utterance end message, so will interact with the LLM now.");
 
                     if running_deepgram_response.is_empty() {
-                        println!("our running deepgram transcript is empty, so will not interact with ChatGPT");
+                        println!("our running deepgram transcript is empty, so will not interact with the LLM");
                         continue;
                     }
 
-                    chatgpt_messages.push(ChatGPTMessage {
+                    llm_messages.push(llm::LlmMessage {
                         role: "user".to_string(),
                         content: running_deepgram_response.clone(),
                     });
 
                     running_deepgram_response = "".to_string();
 
-                    let chatgpt_request = ChatGPTRequest {
-                        model: "gpt-3.5-turbo".to_string(),
-                        messages: chatgpt_messages.clone(),
+                    let llm_request = llm::LlmRequest {
+                        text: llm_messages.clone(),
                     };
 
-                    println!("about to make chatgpt request: {:?}", chatgpt_request);
-                    let chatgpt_client = reqwest::Client::new();
-                    let mut chatgpt_response = None;
-                    loop {
-                        println!("trying to make the chatgpt request");
-                        let chatgpt_future = chatgpt_client
-                            .post("https://api.openai.com/v1/chat/completions")
-                            .bearer_auth(chatgpt_api_key.clone())
-                            .json(&chatgpt_request)
-                            .send();
-                        if let Ok(response) =
-                            timeout(Duration::from_millis(5000), chatgpt_future).await
-                        {
-                            println!("got chatgpt response: {:?}", response);
-                            chatgpt_response = Some(response);
-                            break;
-                        }
-                    }
-                    if let Some(Ok(chatgpt_response)) = chatgpt_response {
-                        if let Ok(chatgpt_response) =
-                            chatgpt_response.json::<ChatGPTResponse>().await
-                        {
-                            println!("got chatgpt Ok response: {:?}", chatgpt_response);
-                            chatgpt_messages.push(chatgpt_response.choices[0].message.clone());
+                    println!("about to make llm request: {:?}", llm_request);
+                    let llm_client = reqwest::Client::new();
+                    let llm_response: llm::LlmResponse = llm_client
+                        .post("https://llm.sandbox.deepgram.com/deepchat")
+                        .json(&llm_request)
+                        .send()
+                        .await
+                        .expect("unable to send llm request")
+                        .json()
+                        .await
+                        .expect("unable to parse llm response as json");
 
-                            let base64_encoded_mulaw = tts::text_to_speech(
-                                chatgpt_response.choices[0].message.content.clone(),
-                                state.clone(),
-                            )
-                            .await;
-                            let sending_media = twilio_response::SendingMedia::new(
-                                streamsid.clone(),
-                                base64_encoded_mulaw,
-                            );
+                    llm_messages.push(llm::LlmMessage {
+                        role: "assistant".to_string(),
+                        content: llm_response.results.clone(),
+                    });
 
-                            let _ = twilio_sender
-                                .send(
-                                    Message::Text(serde_json::to_string(&sending_media).unwrap())
-                                        .into(),
-                                )
-                                .await;
+                    let base64_encoded_mulaw =
+                        tts::text_to_speech(llm_response.results.clone(), state.clone()).await;
+                    let sending_media =
+                        twilio_response::SendingMedia::new(streamsid.clone(), base64_encoded_mulaw);
 
-                            let mut subscribers = state.subscribers.lock().await;
-                            println!("sending chatgpt response to the subscribers");
-                            // send the messages to all subscribers concurrently
-                            let futs = subscribers.iter_mut().map(|subscriber| {
-                                subscriber.send(
-                                    Message::Text(
-                                        serde_json::to_string(&WrappedChatGPTResponse {
-                                            stream_sid: streamsid.clone(),
-                                            post_call: false,
-                                            chatgpt_response: chatgpt_response.clone(),
-                                        })
-                                        .unwrap(),
-                                    )
-                                    .into(),
-                                )
-                            });
-                            let results = futures::future::join_all(futs).await;
+                    let _ = twilio_sender
+                        .send(Message::Text(serde_json::to_string(&sending_media).unwrap()).into())
+                        .await;
 
-                            // if we successfully sent a message then the subscriber is still connected
-                            // other subscribers should be removed
-                            *subscribers = subscribers
-                                .drain(..)
-                                .zip(results)
-                                .filter_map(|(subscriber, result)| {
-                                    result.is_ok().then_some(subscriber)
+                    let mut subscribers = state.subscribers.lock().await;
+                    println!("sending llm response to the subscribers");
+                    // send the messages to all subscribers concurrently
+                    let futs = subscribers.iter_mut().map(|subscriber| {
+                        subscriber.send(
+                            Message::Text(
+                                serde_json::to_string(&llm::WrappedLlmResponse {
+                                    stream_sid: streamsid.clone(),
+                                    post_call: false,
+                                    llm_response: llm_response.clone(),
                                 })
-                                .collect();
-                        }
-                    }
+                                .unwrap(),
+                            )
+                            .into(),
+                        )
+                    });
+                    let results = futures::future::join_all(futs).await;
+
+                    // if we successfully sent a message then the subscriber is still connected
+                    // other subscribers should be removed
+                    *subscribers = subscribers
+                        .drain(..)
+                        .zip(results)
+                        .filter_map(|(subscriber, result)| result.is_ok().then_some(subscriber))
+                        .collect();
                 }
             }
 
@@ -319,68 +253,59 @@ async fn handle_from_deepgram_ws(
         }
     }
 
-    // send post call chatgpt responses to post call chatgpt prompts
+    // send post call llm responses to post call llm prompts
     for post_call_prompt in post_call_prompts {
-        chatgpt_messages.push(ChatGPTMessage {
+        llm_messages.push(llm::LlmMessage {
             role: "user".to_string(),
             content: post_call_prompt.clone(),
         });
 
-        let chatgpt_request = ChatGPTRequest {
-            model: "gpt-3.5-turbo".to_string(),
-            messages: chatgpt_messages.clone(),
+        let llm_request = llm::LlmRequest {
+            text: llm_messages.clone(),
         };
 
-        println!(
-            "about to make post call chatgpt request: {:?}",
-            chatgpt_request
-        );
-        let chatgpt_client = reqwest::Client::new();
-        let mut chatgpt_response = None;
-        loop {
-            println!("trying to make the chatgpt request");
-            let chatgpt_future = chatgpt_client
-                .post("https://api.openai.com/v1/chat/completions")
-                .bearer_auth(chatgpt_api_key.clone())
-                .json(&chatgpt_request)
-                .send();
-            if let Ok(response) = timeout(Duration::from_millis(5000), chatgpt_future).await {
-                println!("got chatgpt response: {:?}", response);
-                chatgpt_response = Some(response);
-                break;
-            }
-        }
-        if let Some(Ok(chatgpt_response)) = chatgpt_response {
-            if let Ok(chatgpt_response) = chatgpt_response.json::<ChatGPTResponse>().await {
-                println!("got chatgpt Ok response: {:?}", chatgpt_response);
-                chatgpt_messages.push(chatgpt_response.choices[0].message.clone());
-                let mut subscribers = state.subscribers.lock().await;
-                println!("sending chatgpt response to the subscribers");
-                // send the messages to all subscribers concurrently
-                let futs = subscribers.iter_mut().map(|subscriber| {
-                    subscriber.send(
-                        Message::Text(
-                            serde_json::to_string(&WrappedChatGPTResponse {
-                                stream_sid: streamsid.clone(),
-                                post_call: true,
-                                chatgpt_response: chatgpt_response.clone(),
-                            })
-                            .unwrap(),
-                        )
-                        .into(),
-                    )
-                });
-                let results = futures::future::join_all(futs).await;
+        println!("about to make llm request: {:?}", llm_request);
+        let llm_client = reqwest::Client::new();
+        let llm_response: llm::LlmResponse = llm_client
+            .post("https://llm.sandbox.deepgram.com/deepchat")
+            .json(&llm_request)
+            .send()
+            .await
+            .expect("unable to send llm request")
+            .json()
+            .await
+            .expect("unable to parse llm response as json");
 
-                // if we successfully sent a message then the subscriber is still connected
-                // other subscribers should be removed
-                *subscribers = subscribers
-                    .drain(..)
-                    .zip(results)
-                    .filter_map(|(subscriber, result)| result.is_ok().then_some(subscriber))
-                    .collect();
-            }
-        }
+        llm_messages.push(llm::LlmMessage {
+            role: "assistant".to_string(),
+            content: llm_response.results.clone(),
+        });
+
+        let mut subscribers = state.subscribers.lock().await;
+        println!("sending llm response to the subscribers");
+        // send the messages to all subscribers concurrently
+        let futs = subscribers.iter_mut().map(|subscriber| {
+            subscriber.send(
+                Message::Text(
+                    serde_json::to_string(&llm::WrappedLlmResponse {
+                        stream_sid: streamsid.clone(),
+                        post_call: true,
+                        llm_response: llm_response.clone(),
+                    })
+                    .unwrap(),
+                )
+                .into(),
+            )
+        });
+        let results = futures::future::join_all(futs).await;
+
+        // if we successfully sent a message then the subscriber is still connected
+        // other subscribers should be removed
+        *subscribers = subscribers
+            .drain(..)
+            .zip(results)
+            .filter_map(|(subscriber, result)| result.is_ok().then_some(subscriber))
+            .collect();
     }
 }
 
@@ -392,6 +317,7 @@ async fn handle_from_twilio_ws(
     >,
     streamsid_tx: oneshot::Sender<String>,
 ) {
+    println!("handle_from_twilio_ws");
     let mut buffer_data = audio::BufferData {
         inbound_buffer: Vec::new(),
         inbound_last_timestamp: 0,

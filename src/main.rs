@@ -8,6 +8,7 @@ use tower_http::cors::CorsLayer;
 mod audio;
 mod deepgram_response;
 mod handlers;
+mod llm;
 mod message;
 mod state;
 mod tts;
@@ -23,9 +24,6 @@ async fn main() {
 
     let deepgram_api_key =
         std::env::var("DEEPGRAM_API_KEY").expect("Using this server requires a Deepgram API Key.");
-
-    let chatgpt_api_key =
-        std::env::var("CHATGPT_API_KEY").expect("Using this server requires a ChatGPT API Key.");
 
     let cert_pem = std::env::var("CERT_PEM").ok();
     let key_pem = std::env::var("KEY_PEM").ok();
@@ -53,7 +51,6 @@ async fn main() {
     let state = Arc::new(state::State {
         deepgram_url,
         deepgram_api_key,
-        chatgpt_api_key,
         subscribers: Mutex::new(Vec::new()),
         pre_call_prompt,
         initial_call_message,
