@@ -25,6 +25,9 @@ async fn main() {
     let deepgram_api_key =
         std::env::var("DEEPGRAM_API_KEY").expect("Using this server requires a Deepgram API Key.");
 
+    let chatgpt_api_key =
+        std::env::var("CHATGPT_API_KEY").expect("Using this server requires a ChatGPT API Key.");
+
     let cert_pem = std::env::var("CERT_PEM").ok();
     let key_pem = std::env::var("KEY_PEM").ok();
 
@@ -40,20 +43,26 @@ async fn main() {
         }
     };
 
-    let pre_call_prompt = Mutex::new("You work at a pizza shop called Paparazzi's answering phone calls from customers trying to order pizza. You only offer delivery, and you need to get the customer's address.".to_string());
-    let initial_call_message =
-        Mutex::new("Hello, this is Paparazzi's, what would you like to order?".to_string());
+    let pre_call_prompt =
+        Mutex::new("You are an insurance agent for home and auto insurance.".to_string());
+    let initial_call_message = Mutex::new("Hello, how may I help you today?".to_string());
+    let introspection_prompt = Mutex::new("I am an insurance agent and you are my coach, read this conversation between a customer and myself and tell me if there is a problem with the way I am communicating - if I am communicating well just say \"hamburger pineapple\"".to_string());
+    let introspection_carry_on = Mutex::new(Some("hamburger pineapple".to_string()));
     let post_call_prompts = Mutex::new(vec![
-        "What did the customer order?".to_string(),
-        "What is the customer's address?".to_string(),
+        "What did the customer call about?".to_string(),
+        "Did the insurance agent do a good job?".to_string(),
     ]);
 
     let state = Arc::new(state::State {
         deepgram_url,
         deepgram_api_key,
+        llm: state::Llm::ChatGPT(chatgpt_api_key),
+        tts: state::Tts::Aws,
         subscribers: Mutex::new(Vec::new()),
         pre_call_prompt,
         initial_call_message,
+        introspection_prompt,
+        introspection_carry_on,
         post_call_prompts,
     });
 
@@ -69,6 +78,10 @@ async fn main() {
             get(handlers::prompts::get_initial_call_message),
         )
         .route(
+            "/introspection-prompt",
+            get(handlers::prompts::get_introspection_prompt),
+        )
+        .route(
             "/post-call-prompts",
             get(handlers::prompts::get_post_call_prompts),
         )
@@ -79,6 +92,10 @@ async fn main() {
         .route(
             "/initial-call-message",
             post(handlers::prompts::post_initial_call_message),
+        )
+        .route(
+            "/introspection-prompt",
+            post(handlers::prompts::post_introspection_prompt),
         )
         .route(
             "/post-call-prompts",

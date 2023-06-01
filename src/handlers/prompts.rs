@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 #[derive(Serialize, Deserialize)]
-pub struct PreCallPrompt {
+pub struct Prompt {
     prompt: String,
 }
 
@@ -17,13 +17,13 @@ pub struct InitialCallMessage {
 }
 
 #[derive(Serialize, Deserialize)]
-pub struct PostCallPrompts {
+pub struct Prompts {
     prompts: Vec<String>,
 }
 
-pub async fn get_pre_call_prompt(Extension(state): Extension<Arc<State>>) -> Json<PreCallPrompt> {
+pub async fn get_pre_call_prompt(Extension(state): Extension<Arc<State>>) -> Json<Prompt> {
     let pre_call_prompt = state.pre_call_prompt.lock().await;
-    Json(PreCallPrompt {
+    Json(Prompt {
         prompt: pre_call_prompt.clone(),
     })
 }
@@ -37,17 +37,22 @@ pub async fn get_initial_call_message(
     })
 }
 
-pub async fn get_post_call_prompts(
-    Extension(state): Extension<Arc<State>>,
-) -> Json<PostCallPrompts> {
+pub async fn get_introspection_prompt(Extension(state): Extension<Arc<State>>) -> Json<Prompt> {
+    let introspection_prompt = state.introspection_prompt.lock().await;
+    Json(Prompt {
+        prompt: introspection_prompt.clone(),
+    })
+}
+
+pub async fn get_post_call_prompts(Extension(state): Extension<Arc<State>>) -> Json<Prompts> {
     let post_call_prompts = state.post_call_prompts.lock().await;
-    Json(PostCallPrompts {
+    Json(Prompts {
         prompts: post_call_prompts.clone(),
     })
 }
 
 pub async fn post_pre_call_prompt(
-    extract::Json(payload): extract::Json<PreCallPrompt>,
+    extract::Json(payload): extract::Json<Prompt>,
     Extension(state): Extension<Arc<State>>,
 ) -> StatusCode {
     let mut pre_call_prompt = state.pre_call_prompt.lock().await;
@@ -66,8 +71,18 @@ pub async fn post_initial_call_message(
     StatusCode::OK
 }
 
+pub async fn post_introspection_prompt(
+    extract::Json(payload): extract::Json<Prompt>,
+    Extension(state): Extension<Arc<State>>,
+) -> StatusCode {
+    let mut introspection_prompt = state.introspection_prompt.lock().await;
+    *introspection_prompt = payload.prompt;
+
+    StatusCode::OK
+}
+
 pub async fn post_post_call_prompts(
-    extract::Json(payload): extract::Json<PostCallPrompts>,
+    extract::Json(payload): extract::Json<Prompts>,
     Extension(state): Extension<Arc<State>>,
 ) -> StatusCode {
     let mut post_call_prompts = state.post_call_prompts.lock().await;

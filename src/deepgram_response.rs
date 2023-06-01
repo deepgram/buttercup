@@ -1,12 +1,6 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct WrappedStreamingResponse {
-    pub stream_sid: String,
-    pub streaming_response: StreamingResponse,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct StreamingResponse {
     pub channel_index: (u16, u16),
     pub duration: f32,
