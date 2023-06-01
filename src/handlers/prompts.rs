@@ -17,6 +17,16 @@ pub struct InitialCallMessage {
 }
 
 #[derive(Serialize, Deserialize)]
+pub struct IntrospectionCarryOnRequest {
+    introspection_carry_on: String,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct IntrospectionCarryOnResponse {
+    introspection_carry_on: Option<String>,
+}
+
+#[derive(Serialize, Deserialize)]
 pub struct Prompts {
     prompts: Vec<String>,
 }
@@ -41,6 +51,15 @@ pub async fn get_introspection_prompt(Extension(state): Extension<Arc<State>>) -
     let introspection_prompt = state.introspection_prompt.lock().await;
     Json(Prompt {
         prompt: introspection_prompt.clone(),
+    })
+}
+
+pub async fn get_introspection_carry_on(
+    Extension(state): Extension<Arc<State>>,
+) -> Json<IntrospectionCarryOnResponse> {
+    let introspection_carry_on = state.introspection_carry_on.lock().await;
+    Json(IntrospectionCarryOnResponse {
+        introspection_carry_on: introspection_carry_on.clone(),
     })
 }
 
@@ -81,12 +100,29 @@ pub async fn post_introspection_prompt(
     StatusCode::OK
 }
 
+pub async fn post_introspection_carry_on(
+    extract::Json(payload): extract::Json<IntrospectionCarryOnRequest>,
+    Extension(state): Extension<Arc<State>>,
+) -> StatusCode {
+    let mut introspection_carry_on = state.introspection_carry_on.lock().await;
+    *introspection_carry_on = Some(payload.introspection_carry_on);
+
+    StatusCode::OK
+}
+
 pub async fn post_post_call_prompts(
     extract::Json(payload): extract::Json<Prompts>,
     Extension(state): Extension<Arc<State>>,
 ) -> StatusCode {
     let mut post_call_prompts = state.post_call_prompts.lock().await;
     *post_call_prompts = payload.prompts;
+
+    StatusCode::OK
+}
+
+pub async fn delete_introspection_carry_on(Extension(state): Extension<Arc<State>>) -> StatusCode {
+    let mut introspection_carry_on = state.introspection_carry_on.lock().await;
+    *introspection_carry_on = None;
 
     StatusCode::OK
 }

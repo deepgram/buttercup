@@ -297,7 +297,7 @@ async fn handle_from_twilio_ws(
                         if let Some(streamsid_tx) = streamsid_tx.take() {
                             streamsid_tx
                                 .send(start.stream_sid.clone())
-                                .expect("Failed to send streamsid to handle_to_game_rx.");
+                                .expect("Failed to send streamsid to handle_from_deepgram_ws.");
                         }
                     }
                     twilio_response::EventType::Media(media) => {

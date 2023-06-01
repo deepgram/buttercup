@@ -1,4 +1,4 @@
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Extension, Router};
 use axum_server::tls_rustls::RustlsConfig;
 use futures::lock::Mutex;
@@ -82,6 +82,10 @@ async fn main() {
             get(handlers::prompts::get_introspection_prompt),
         )
         .route(
+            "/introspection-carry-on",
+            get(handlers::prompts::get_introspection_carry_on),
+        )
+        .route(
             "/post-call-prompts",
             get(handlers::prompts::get_post_call_prompts),
         )
@@ -98,8 +102,16 @@ async fn main() {
             post(handlers::prompts::post_introspection_prompt),
         )
         .route(
+            "/introspection-carry-on",
+            post(handlers::prompts::post_introspection_carry_on),
+        )
+        .route(
             "/post-call-prompts",
             post(handlers::prompts::post_post_call_prompts),
+        )
+        .route(
+            "/introspection-carry-on",
+            delete(handlers::prompts::delete_introspection_carry_on),
         )
         .layer(CorsLayer::permissive())
         .layer(Extension(state));
